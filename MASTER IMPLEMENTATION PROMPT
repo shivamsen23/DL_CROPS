@@ -1,0 +1,670 @@
+# MASTER IMPLEMENTATION PROMPT
+# Crop Classification — 6 Notebook Rewrite
+
+---
+
+## YOUR ROLE
+
+You are an expert ML engineer rewriting 6 Jupyter notebooks for an agricultural crop classification project.
+You must apply every change listed in this prompt to each of the 6 target notebooks.
+The changes are grouped into CRITICAL BUGS (fix first), PERFORMANCE, and ACCURACY improvements.
+
+DO NOT change: frozen train/val/test splits, class definitions, normalization approach, Adam optimizer,
+the 6-notebook experimental design, or any existing `.md` documentation files.
+
+---
+
+## PROJECT STRUCTURE
+
+```
+crop-classification/
+├── Models_DL/                          ← All 6 notebooks live here
+│   ├── 01_VMamba_Kharif_Adam.ipynb
+│   ├── 02_VMamba_Rabi_Adam.ipynb
+│   ├── 03_InternImage_Kharif_Adam.ipynb
+│   ├── 04_InternImage_Rabi_Adam.ipynb
+│   ├── 05_Hybrid_InternImage_VMamba_Kharif_Adam.ipynb
+│   └── 06_Hybrid_InternImage_VMamba_Rabi_Adam.ipynb
+├── 01_CODE/
+│   ├── VMamba/official_repo/classification/models/   ← vmamba.py, csm_triton.py etc.
+│   └── InternImage/official_repo/classification/     ← models/, ops_dcnv3/
+├── 06_RESULTS/SPLITS/                  ← FROZEN .npy split files (DO NOT regenerate)
+│   ├── kharif_train_idx.npy  (89,564)
+│   ├── kharif_val_idx.npy    (11,194)
+│   ├── kharif_test_idx.npy   (11,198)
+│   ├── rabi_train_idx.npy    (103,213)
+│   ├── rabi_val_idx.npy      (12,901)
+│   └── rabi_test_idx.npy     (12,901)
+├── FINAL_KHARIF.pickle                 ← 16 classes, 111,956 samples, dict{class:[{data:(12,7,7),...}]}
+└── FINAL_RABI.pickle                   ← 13 classes, 129,015 samples, same format
+```
+
+---
+
+## NOTEBOOK METADATA
+
+| Notebook | Season | Architecture | Classes | Checkpoint Path |
+|----------|--------|-------------|---------|-----------------|
+| 01 | Kharif | VMamba | 16 | Results/Kharif/VMamba/best_model.pth |
+| 02 | Rabi   | VMamba | 13 | Results/Rabi/VMamba/best_model.pth |
+| 03 | Kharif | InternImage | 16 | Results/Kharif/InternImage/best_model.pth |
+| 04 | Rabi   | InternImage | 13 | Results/Rabi/InternImage/best_model.pth |
+| 05 | Kharif | Hybrid | 16 | Results/Kharif/Hybrid/best_model.pth |
+| 06 | Rabi   | Hybrid | 13 | Results/Rabi/Hybrid/best_model.pth |
+
+---
+
+## NOTEBOOK CELL STRUCTURE (8 cells, same for all 6)
+
+- Cell 0: Markdown header
+- Cell 1: Imports (sys, os, numpy, torch, pickle, sklearn, matplotlib, json, time, pathlib)
+- Cell 2: Configuration (ALL config variables HERE, nothing else)
+- Cell 3: Dataset loading and audit
+- Cell 4: Data preprocessing (splits, normalization, Dataset class, DataLoaders)
+- Cell 5: Model architecture (path setup, stubs, imports, model class definitions, instantiate, shape test)
+- Cell 6: Training loop with Adam
+- Cell 7: Evaluation (load checkpoint, test metrics)
+- Cell 8: Plots (loss/acc curves, confusion matrix, per-class accuracy bar chart)
+- Cell 9: Final report (print complete summary)
+
+---
+
+## ══════════════════════════════════════
+## SECTION A — CRITICAL BUG FIXES (ALL 6 NOTEBOOKS)
+## ══════════════════════════════════════
+
+### A1 — FIX ALL SYNTAX ERRORS
+
+**Problem:** Escaped docstrings `\"\"\"` inside notebook JSON source lines and raw newlines inside f-strings
+cause every notebook to fail Python `compile()`. NONE of the 6 notebooks can currently be executed.
+
+**Fix rule:** In the notebook JSON source arrays:
+- Replace ALL occurrences of `\"\"\"` with `'''` (triple single-quote)
+- OR rewrite class/function docstrings as `# comment` lines
+- Fix any f-string that contains a literal newline character — move the content to a separate variable first
+
+**Example fix:**
+```python
+# WRONG in JSON source:
+"class MyModel(nn.Module):\n    \\\"\\\"\\\"\n    Docstring\n    \\\"\\\"\\\"\n"
+
+# CORRECT:
+"class MyModel(nn.Module):\n    '''Docstring'''\n"
+```
+
+---
+
+### A2 — ADD MISSING LR_WARMUP_EPOCHS (NB03, NB04, NB05, NB06 only)
+
+In Cell 2 (Configuration), add this line:
+```python
+LR_WARMUP_EPOCHS = 5
+```
+Place it immediately after `LR = 1e-4`.
+
+---
+
+### A3 — FIX WARMUP LR ORDERING BUG (ALL 6 NOTEBOOKS)
+
+**Problem:** The optimizer is created at full LR, then warmup is applied after the first epoch completes.
+Epoch 1 incorrectly runs at full LR instead of the lowest warmup LR.
+
+**Correct warmup pattern** — at the TOP of the epoch loop, BEFORE `model.train()`:
+```python
+for epoch in range(1, MAX_EPOCHS + 1):
+    # ── Apply warmup or scheduler at START of epoch
+    if epoch <= LR_WARMUP_EPOCHS:
+        warmup_factor = epoch / LR_WARMUP_EPOCHS
+        for pg in optimizer.param_groups:
+            pg['lr'] = LR * warmup_factor
+    else:
+        scheduler.step()
+    current_lr = optimizer.param_groups[0]['lr']
+    
+    # ── Training phase
+    model.train()
+    ...
+```
+
+Remove any warmup LR assignment that appears at the END of the epoch loop.
+
+---
+
+### A4 — FIX HYBRID FEATURE PROBE TENSOR (NB05, NB06 only)
+
+In `InternImageFeatureExtractor.__init__`, the probe tensor that measures `feature_dim` must match
+the actual input shape that will enter `forward()`.
+
+Since the shared adapter converts `(B, 12, 7, 7) → (B, 3, 7, 7)`, and the extractor's `forward()`
+receives the already-adapted `(B, 3, 7, 7)` tensor, the probe must be:
+
+```python
+# CORRECT probe in InternImageFeatureExtractor.__init__:
+with torch.no_grad():
+    _probe = torch.zeros(1, 3, 7, 7)   # post-adapter shape
+    _probe = self.patch_embed(_probe)
+    _probe = self.pos_drop(_probe)
+    for lvl in self.levels:
+        _probe = lvl(_probe)
+    _probe = _probe.permute(0, 3, 1, 2)
+    _probe = self.conv_head(_probe)
+    _probe = self.avgpool(_probe)
+    self.feature_dim = int(_probe.flatten(1).shape[1])
+
+assert self.feature_dim > 0, f"Probe failed: feature_dim={self.feature_dim}"
+print(f"InternImage feature_dim probed: {self.feature_dim}")
+```
+
+---
+
+### A5 — SEPARATE SMOKE TEST AND REAL CHECKPOINTS (ALL 6 NOTEBOOKS)
+
+In Cell 2 (Configuration), after `RESULTS_DIR` is defined:
+```python
+RESULTS_DIR = Path(f'Results/{SEASON}/{ARCH_NAME}')
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# SEPARATE paths for smoke test vs real training:
+if SMOKE_TEST:
+    CKPT_PATH = RESULTS_DIR / 'smoke_best_model.pth'
+else:
+    CKPT_PATH = RESULTS_DIR / 'best_model.pth'
+```
+
+---
+
+### A6 — CONSISTENT AMP PRECISION FOR VALIDATION AND TEST (ALL 6 NOTEBOOKS)
+
+Wrap ALL evaluation (both validation inside the training loop AND the test evaluation in Cell 7)
+in `torch.cuda.amp.autocast()`:
+
+```python
+# In training loop validation phase:
+model.eval()
+with torch.no_grad():
+    with torch.cuda.amp.autocast():
+        for inputs, targets in val_loader:
+            ...
+
+# In Cell 7 test evaluation:
+model.eval()
+with torch.no_grad():
+    with torch.cuda.amp.autocast():
+        for inputs, targets in test_loader:
+            ...
+```
+
+---
+
+### A7 — FIX DCNv3 MASK (ATTENTION WEIGHT) NORMALIZATION (NB03, NB04, NB05, NB06 only)
+
+**Problem:** Softmax is applied over all groups × K points together.
+Must be applied within each group independently.
+
+Find the line in `DCNv3_pytorch.forward()` where `attn_weight` / `mask` softmax is computed.
+Change from:
+```python
+# WRONG — softmax over (G * K) flattened:
+attn = attn.reshape(B, H, W, G * K).softmax(-1).reshape(B, H, W, G, K)
+```
+To:
+```python
+# CORRECT — softmax within each group (last dim = K sampling points):
+attn = attn.reshape(B, H, W, G, K).softmax(-1)
+```
+
+The variable names may differ slightly — search for `.softmax(` inside `DCNv3_pytorch` and verify the
+reshape order. The softmax must be applied on the **K** (sampling points) dimension, separately per group G.
+
+---
+
+### A8 — FIX LOSS AGGREGATION FOR WEIGHTED CROSS-ENTROPY (ALL 6 NOTEBOOKS)
+
+Replace per-step loss accumulation in the training loop with correct averaging:
+
+```python
+# CORRECT pattern:
+train_loss_sum = 0.0
+train_correct = 0
+train_total = 0
+
+for batch_idx, (inputs, targets) in enumerate(train_loader):
+    if SMOKE_TEST and batch_idx >= SMOKE_BATCHES:
+        break
+    inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
+    optimizer.zero_grad()
+    with torch.cuda.amp.autocast():
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+    scaler.step(optimizer)
+    scaler.update()
+    
+    # Accumulate as float (detached), not calling .item() every step
+    train_loss_sum += loss.detach().float() * inputs.size(0)
+    preds = outputs.detach().argmax(1)
+    train_correct += (preds == targets).sum()
+    train_total += inputs.size(0)
+
+# After loop — single .item() call per epoch:
+train_loss = (train_loss_sum / train_total).item()
+train_acc  = (train_correct / train_total).item()
+```
+
+---
+
+### A9 — HARD FAIL IF FROZEN SPLITS ARE MISSING (ALL 6 NOTEBOOKS)
+
+In Cell 4, remove any code that generates new splits when files are missing.
+Replace with a hard assertion:
+
+```python
+splits_dir = PROJECT_ROOT / '06_RESULTS' / 'SPLITS'
+train_path = splits_dir / f'{SEASON.lower()}_train_idx.npy'
+val_path   = splits_dir / f'{SEASON.lower()}_val_idx.npy'
+test_path  = splits_dir / f'{SEASON.lower()}_test_idx.npy'
+
+assert train_path.exists(), (
+    f"FROZEN SPLIT MISSING: {train_path}\n"
+    f"DO NOT regenerate splits — contact project owner to restore from backup."
+)
+assert val_path.exists(),   f"FROZEN SPLIT MISSING: {val_path}"
+assert test_path.exists(),  f"FROZEN SPLIT MISSING: {test_path}"
+
+train_idx = np.load(str(train_path))
+val_idx   = np.load(str(val_path))
+test_idx  = np.load(str(test_path))
+print(f"Splits loaded — Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+```
+
+---
+
+## ══════════════════════════════════════
+## SECTION B — PERFORMANCE IMPROVEMENTS
+## ══════════════════════════════════════
+
+### B1 — LIGHTWEIGHT VMAMBA ARCHITECTURE (NB01, NB02, NB05, NB06 only)
+
+Change VMamba depth and dimension in Cell 2 (Configuration):
+```python
+# OLD (heavy, designed for 224x224 images):
+# VMAMBA_DEPTHS = [2, 2, 4, 2]
+# VMAMBA_DIMS   = 48
+
+# NEW (lightweight, designed for 7x7 tiles):
+VMAMBA_DEPTHS = [1, 1, 1, 1]   # 4 VSS blocks total instead of 10
+VMAMBA_DIMS   = 32              # channel dim 32 instead of 48
+```
+
+Update the `VMambaCropClassifier.__init__` call to use these variables:
+```python
+self.backbone = VSSM(
+    patch_size=1, in_chans=3, num_classes=num_classes,
+    depths=VMAMBA_DEPTHS, dims=VMAMBA_DIMS,
+    drop_path_rate=drop_path_rate,
+    ssm_d_state=16, ssm_ratio=2.0, ssm_dt_rank='auto',
+    ssm_act_layer='silu', ssm_conv=3, ssm_conv_bias=True,
+    ssm_init='v0', ssm_drop_rate=0.0,
+    forward_type=forward_type, mlp_ratio=0.0, patch_norm=True,
+    norm_layer='ln', downsample_version='v3', patchembed_version='v1',
+    use_checkpoint=False, posembed=False, imgsize=7,
+)
+```
+
+In the HybridInternImageVMambaClassifier, use the same lightweight defaults:
+```python
+def __init__(self, num_classes, in_chans=12,
+             vmamba_dims=32,          # Changed from 48
+             vmamba_depths=None,      # Will default to [1,1,1,1]
+             ...):
+    if vmamba_depths is None:
+        vmamba_depths = [1, 1, 1, 1]  # Changed from [2,2,4,2]
+```
+
+**Expected impact:**
+- VMamba params: ~3.98M → ~1.1M (~72% reduction)
+- Hybrid params: ~10.58M → ~7.7M (~27% reduction)
+- Forward scan iterations: 148 → ~70 per forward pass
+- Estimated training time: 06_Hybrid_Rabi from ~1,457 min → ~60-90 min
+
+---
+
+### B2 — ADD PER-PHASE TIMING AND SAVE HISTORY JSON (ALL 6 NOTEBOOKS)
+
+In Cell 6 (Training), add timing wrappers and save history:
+
+```python
+import time, json
+
+history = {
+    'train_loss': [], 'train_acc': [],
+    'val_loss':   [], 'val_acc':   [],
+    'lr': [],
+    'epoch_train_time_s': [],
+    'epoch_val_time_s':   [],
+}
+
+for epoch in range(1, MAX_EPOCHS + 1):
+    # [warmup/scheduler code here]
+    
+    # ── Training phase timing
+    t_train_start = time.perf_counter()
+    model.train()
+    # ... training loop ...
+    epoch_train_time = time.perf_counter() - t_train_start
+    
+    # ── Validation phase timing
+    t_val_start = time.perf_counter()
+    model.eval()
+    # ... validation loop ...
+    epoch_val_time = time.perf_counter() - t_val_start
+    
+    # Record history
+    history['train_loss'].append(train_loss)
+    history['train_acc'].append(train_acc)
+    history['val_loss'].append(val_loss)
+    history['val_acc'].append(val_acc)
+    history['lr'].append(current_lr)
+    history['epoch_train_time_s'].append(epoch_train_time)
+    history['epoch_val_time_s'].append(epoch_val_time)
+    
+    print(f"Epoch {epoch:03d}/{MAX_EPOCHS} | "
+          f"Train: {train_loss:.4f}/{train_acc:.4f} | "
+          f"Val: {val_loss:.4f}/{val_acc:.4f} | "
+          f"LR: {current_lr:.2e} | "
+          f"Train: {epoch_train_time:.1f}s Val: {epoch_val_time:.1f}s")
+
+# After training loop ends:
+history_path = RESULTS_DIR / 'history.json'
+with open(history_path, 'w') as f:
+    json.dump(history, f, indent=2)
+print(f"History saved to {history_path}")
+```
+
+---
+
+### B3 — SAVE COMPLETE CHECKPOINT WITH CLASS MAP AND NORM STATS (ALL 6 NOTEBOOKS)
+
+Replace the `torch.save(...)` call in the training loop with:
+
+```python
+if val_acc > best_val_acc:
+    best_val_acc = val_acc
+    torch.save({
+        'epoch':                 epoch,
+        'model_state_dict':      model.state_dict(),
+        'optimizer_state_dict':  optimizer.state_dict(),
+        'scheduler_state_dict':  scheduler.state_dict(),
+        'scaler_state_dict':     scaler.state_dict(),
+        'val_acc':               val_acc,
+        'val_loss':              val_loss,
+        'class_to_id':           class_to_id,
+        'norm_mean':             norm_mean.tolist(),
+        'norm_std':              norm_std.tolist(),
+        'config': {
+            'SEASON':       SEASON,
+            'ARCH_NAME':    ARCH_NAME,
+            'NUM_CLASSES':  NUM_CLASSES,
+            'BATCH_SIZE':   BATCH_SIZE,
+            'MAX_EPOCHS':   MAX_EPOCHS,
+            'LR':           LR,
+            'SMOKE_TEST':   SMOKE_TEST,
+        }
+    }, CKPT_PATH)
+    print(f"  ✓ Checkpoint saved (epoch {epoch}, val_acc={val_acc:.4f})")
+```
+
+In Cell 7 (Evaluation), add a sanity check after loading:
+```python
+ckpt = torch.load(CKPT_PATH, map_location=DEVICE)
+# Verify class mapping matches current dataset:
+if 'class_to_id' in ckpt:
+    assert ckpt['class_to_id'] == class_to_id, (
+        f"CLASS MAPPING MISMATCH!\n"
+        f"Checkpoint classes: {list(ckpt['class_to_id'].keys())}\n"
+        f"Current classes:    {list(class_to_id.keys())}"
+    )
+model.load_state_dict(ckpt['model_state_dict'])
+print(f"Loaded checkpoint from epoch {ckpt['epoch']}, val_acc={ckpt['val_acc']:.4f}")
+```
+
+---
+
+## ══════════════════════════════════════
+## SECTION C — ACCURACY IMPROVEMENTS
+## ══════════════════════════════════════
+
+### C1 — REPLACE ReduceLROnPlateau WITH CosineAnnealingLR (ALL 6 NOTEBOOKS)
+
+Remove `ReduceLROnPlateau`. Add `CosineAnnealingLR`:
+
+```python
+# In Cell 6, after optimizer definition:
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer,
+    T_max   = MAX_EPOCHS - LR_WARMUP_EPOCHS,
+    eta_min = 1e-6,
+)
+
+# Warmup and scheduler stepping (in epoch loop, BEFORE model.train()):
+if epoch <= LR_WARMUP_EPOCHS:
+    warmup_factor = epoch / LR_WARMUP_EPOCHS
+    for pg in optimizer.param_groups:
+        pg['lr'] = LR * warmup_factor
+else:
+    scheduler.step()
+current_lr = optimizer.param_groups[0]['lr']
+```
+
+---
+
+### C2 — EXTEND MAX EPOCHS TO 150 (ALL 6 NOTEBOOKS)
+
+In Cell 2 (Configuration):
+```python
+MAX_EPOCHS = 150   # Extended from 100 — models were still improving at epoch 97-100
+```
+
+---
+
+### C3 — PER-BRANCH LAYERNORM BEFORE FUSION (NB05, NB06 only)
+
+In `HybridInternImageVMambaClassifier.__init__`, add normalization layers:
+```python
+# After determining vm_dim and im_dim:
+self.vmamba_norm = nn.LayerNorm(vm_dim)   # NEW
+self.intern_norm = nn.LayerNorm(im_dim)   # NEW
+
+self.fusion_layer = nn.Sequential(nn.Linear(cat_dim, fus_dim), nn.GELU())
+self.fusion_proj  = nn.Sequential(nn.Linear(fus_dim, fus_dim), nn.GELU())
+self.dropout      = nn.Dropout(p=dropout_rate)
+self.classifier   = nn.Linear(fus_dim, num_classes)
+```
+
+In `forward()`:
+```python
+def forward(self, x):
+    x3   = self.adapter(x)
+    f_vm = self.vmamba_norm(self.vmamba_extractor(x3))   # normalized
+    f_im = self.intern_norm(self.intern_extractor(x3))   # normalized
+    f    = torch.cat([f_im, f_vm], dim=1)
+    f    = self.fusion_layer(f)
+    f    = self.fusion_proj(f)
+    f    = self.dropout(f)
+    return self.classifier(f)
+```
+
+---
+
+## ══════════════════════════════════════
+## SECTION D — CONFIGURATION CELL TEMPLATE
+## ══════════════════════════════════════
+
+Each notebook's Cell 2 must contain ALL of these variables (adapt SEASON, ARCH_NAME, NUM_CLASSES per notebook):
+
+```python
+# ═══════════════════════════════════════════════════════
+# EXPERIMENT CONFIGURATION
+# ═══════════════════════════════════════════════════════
+import random
+import numpy as np
+import torch
+
+# ── Experiment identity
+SEASON         = 'Kharif'          # or 'Rabi'
+ARCH_NAME      = 'VMamba'          # or 'InternImage' or 'Hybrid'
+NUM_CLASSES    = 16                # Kharif=16, Rabi=13
+EXPERIMENT_ID  = f'{ARCH_NAME}_{SEASON}'
+
+# ── Training control
+SMOKE_TEST       = True            # Set to False for full training
+SMOKE_BATCHES    = 2
+SMOKE_EPOCHS     = 2
+MAX_EPOCHS       = 150
+BATCH_SIZE       = 128
+NUM_WORKERS      = 4               # Use 0 on Windows, 4 on Linux GPU server
+
+# ── Optimizer
+LR               = 1e-4
+WEIGHT_DECAY     = 1e-4
+LR_WARMUP_EPOCHS = 5               # Warmup from LR/5 → LR over first 5 epochs
+
+# ── Regularization
+GRAD_CLIP        = 1.0
+DROPOUT_RATE     = 0.3             # Used in Hybrid fusion only
+
+# ── Reproducibility
+SEED             = 42
+
+# ── VMamba-specific (NB01, 02, 05, 06 only)
+VMAMBA_DEPTHS      = [1, 1, 1, 1]  # Lightweight! Was [2,2,4,2]
+VMAMBA_DIMS        = 32             # Was 48
+VMAMBA_FORWARD_TYPE = 'v05_noz'     # Change to 'v2' on GPU server if CUDA extension compiled
+
+# ── Drop path rate
+DROP_PATH_RATE   = 0.1
+
+# ── Device
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Device: {DEVICE}")
+if DEVICE.type == 'cuda':
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+# ── Seeding
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if DEVICE.type == 'cuda':
+    torch.cuda.manual_seed_all(SEED)
+
+# ── Paths
+from pathlib import Path
+PROJECT_ROOT = Path('.').resolve().parent
+SPLITS_DIR   = PROJECT_ROOT / '06_RESULTS' / 'SPLITS'
+RESULTS_DIR  = Path(f'Results/{SEASON}/{ARCH_NAME}')
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── Checkpoint path (SEPARATE for smoke vs real training)
+if SMOKE_TEST:
+    CKPT_PATH = RESULTS_DIR / 'smoke_best_model.pth'
+else:
+    CKPT_PATH = RESULTS_DIR / 'best_model.pth'
+
+print(f"Experiment: {EXPERIMENT_ID} | SMOKE_TEST={SMOKE_TEST} | MAX_EPOCHS={MAX_EPOCHS}")
+print(f"Checkpoint: {CKPT_PATH}")
+```
+
+---
+
+## ══════════════════════════════════════
+## SECTION E — ADDITIONAL GUARDS AND CHECKS
+## ══════════════════════════════════════
+
+### E1 — Add shape validation after model instantiation (Cell 5 for all notebooks)
+
+```python
+# Shape sanity test after model is created
+model = model.to(DEVICE)
+model.eval()
+with torch.no_grad():
+    _dummy = torch.zeros(2, 12, 7, 7).to(DEVICE)
+    try:
+        _out = model(_dummy)
+        assert _out.shape == (2, NUM_CLASSES), \
+            f"Output shape {_out.shape} != expected (2, {NUM_CLASSES})"
+        print(f"Shape test passed: {_dummy.shape} → {_out.shape}")
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Total parameters:     {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,}")
+    except Exception as e:
+        print(f"Shape test FAILED: {e}")
+        raise
+model.train()
+```
+
+---
+
+## ══════════════════════════════════════
+## SECTION F — WHAT NOT TO CHANGE
+## ══════════════════════════════════════
+
+**DO NOT change any of the following:**
+
+1. The frozen split `.npy` files — any experiment run with different splits is scientifically invalid
+2. The normalization computation pattern: mean/std from training indices only, applied in `Dataset.__getitem__`
+3. The Adam optimizer — project requirement
+4. The class_to_id mapping (must be `sorted(raw.keys())` for reproducibility)
+5. The 6-notebook experimental design (VMamba × 2, InternImage × 2, Hybrid × 2)
+6. Any existing `.md` documentation files in `Models_DL/`
+7. The dataset pickle loading pattern
+8. The overall 8-cell notebook structure
+
+---
+
+## ══════════════════════════════════════
+## SECTION G — CHANGE APPLICATION ORDER
+## ══════════════════════════════════════
+
+Apply changes in this exact order to avoid cascading errors:
+
+```
+1. Fix syntax errors first (A1) — otherwise no cell can be parsed
+2. Add missing config variables (A2, A5, SECTION D template)
+3. Fix Cell 4: Split loading → hard fail instead of regenerate (A9)
+4. Fix Cell 5: Lightweight VMamba config (B1), DCNv3 mask norm (A7), probe tensor (A4)
+5. Fix Cell 6: Warmup ordering (A3), Loss aggregation (A8), Scheduler (C1),
+               Timing (B2), Checkpoint saving (B3), AMP consistency (A6)
+6. Fix Cell 7: Checkpoint loading with validation (B3 part 2), AMP wrapper (A6)
+7. Add per-branch LayerNorm in Hybrid only (C3)
+8. Update MAX_EPOCHS to 150 everywhere (C2)
+9. Final: Run smoke test (SMOKE_TEST=True) to verify all 6 notebooks compile and run 2 epochs
+```
+
+---
+
+## VERIFICATION CHECKLIST
+
+Before declaring the implementation complete, verify ALL of the following:
+
+- [ ] `python -c "import ast; ast.parse(open('01_VMamba_Kharif_Adam.py').read())"` passes for all 6 notebooks (export as .py to verify)
+- [ ] `SMOKE_TEST = True` — each notebook runs 2 epochs without error on CPU
+- [ ] `CKPT_PATH` prints `smoke_best_model.pth` when `SMOKE_TEST = True`
+- [ ] Checkpoint contains `class_to_id`, `norm_mean`, `norm_std`, `config`
+- [ ] History JSON is saved after each run
+- [ ] Split regeneration fallback code is GONE — missing splits now cause `AssertionError`
+- [ ] LR at epoch 1 is `LR * (1/LR_WARMUP_EPOCHS) = 2e-5`, not `1e-4`
+- [ ] DCNv3 softmax is applied on dim=-1 with shape `(B, H, W, G, K)`, not `(B, H, W, G*K)`
+- [ ] VMamba depths are `[1,1,1,1]` with dims=32 in NB01, 02, 05, 06
+- [ ] Both validation loop and test evaluation are wrapped in `torch.cuda.amp.autocast()`
+- [ ] No `.item()` calls inside the per-batch training loop
+
+---
+
+*This prompt synthesizes findings from:*
+- *IMPLEMENTATION_NEW_VERSION.md (first audit)*
+- *IMPLEMENTATION_NEW_VERSION_ASTRA.md (second independent audit)*
+- *Project session history and verified code inspection*
